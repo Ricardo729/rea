@@ -62,11 +62,11 @@ The background export belongs to the session. `close_binary`, or the end of a CL
 REA writes Kuna's exports only inside `REA_KUNA_CACHE_DIR`:
 
 - `projects/<key>/` holds published, immutable exports with a manifest of file digests.
-- `staging/` holds builds in progress.
-- `trash/` holds evicted exports awaiting removal.
+- `staging/` holds builds whose processes may still be live.
+- `trash/` holds retired builds and evicted exports awaiting removal.
 - `home/` is Kuna's HOME.
 
-Builds publish by one rename, so a reader sees a complete export or none. A session keeps the export it uses from eviction only within its own REA process. If another REA process sharing the cache evicts it, the session rebuilds it; meanwhile pseudocode falls back to single-function runs. A damaged or edited export is removed and rebuilt. Staging left by a Kuna process REA could not prove stopped is marked and never removed automatically. `rea doctor --provider kuna` reports the cache directory without creating it.
+Builds publish by one rename, so a reader sees a complete export or none. A session keeps the export it uses from eviction only within its own REA process. If another REA process sharing the cache evicts it, the session rebuilds it; meanwhile pseudocode falls back to single-function runs. A damaged or edited export is removed and rebuilt. Staging moves to `trash/` for removal only after REA proves its Kuna process stopped. Staging of a process it cannot prove stopped is never swept; REA keeps it owned, retries the stop on `close_binary`, and reports it until the stop is proven. `rea doctor --provider kuna` reports the cache directory without creating it.
 
 ## Verify with a real Kuna
 
