@@ -51,11 +51,17 @@ assert.ok(
   kuna !== undefined && kuna.startsWith("/"),
   "Kuna lane prerequisite missing: REA_KUNA_COMMAND must name a caller-supplied kuna by absolute path (bring your own)",
 );
-if (values["compare-ghidra"])
+if (values["compare-ghidra"]) {
+  // The comparison runs on caller-built targets only; the fixture has none.
+  assert.ok(
+    values.targets !== undefined && values.functions !== undefined,
+    "--compare-ghidra compares caller-built targets: pass --targets DIR --functions a,b as well",
+  );
   assert.ok(
     process.env.GHIDRA_INSTALL_DIR,
     "Ghidra comparison prerequisite missing: GHIDRA_INSTALL_DIR (bring your own Ghidra 12.1.4 and JDK 21)",
   );
+}
 const kunaVersion = (await exec(kuna, ["--version"])).stdout.trim();
 const run = createVerifierRun();
 const workspace = await mkdtemp(join(tmpdir(), "rea-kuna-lane-"));
