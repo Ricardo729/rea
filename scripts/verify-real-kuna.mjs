@@ -179,7 +179,7 @@ const openServer = async (provider) => {
       { timeout: 3_600_000 },
     );
     const ms = Math.round(performance.now() - started);
-    const bytes = JSON.stringify(result).length;
+    const bytes = Buffer.byteLength(JSON.stringify(result));
     return {
       ms,
       bytes,
@@ -219,7 +219,6 @@ const openServer = async (provider) => {
 /** Count structuring and diagnostic markers in provider pseudocode. */
 const quality = (text) => ({
   bytes: text === null ? 0 : Buffer.byteLength(text),
-  approx_tokens: text === null ? 0 : Math.round(text.length / 4),
   gotos: text === null ? 0 : (text.match(/\bgoto\b/gu) ?? []).length,
   warnings:
     text === null ? 0 : (text.match(/WARNING|\/\/ warn:/gu) ?? []).length,
@@ -410,6 +409,7 @@ const report = {
     "Targets are analyzed statically; they are never executed.",
     "Memory is the sampled peak resident set of the MCP server process tree; CPU is its sampled cumulative time. A short-lived peak between 200 ms samples is not observed.",
     "Quality signals count gotos and warning markers only; they are not a correctness judgement and not a DecBench reproduction.",
+    "Response bytes are UTF-8 serialization sizes. Model token usage, tool schema costs and agent task completion were not measured.",
   ],
   cleanup: "complete",
 };

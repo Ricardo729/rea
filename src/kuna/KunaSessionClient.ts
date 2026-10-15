@@ -180,6 +180,10 @@ export class KunaSessionClient implements AnalysisClient {
   readonly #launcher: KunaProcessLauncher | undefined;
   /** Owns background work: aborting it cancels this session's export interest. */
   readonly #session = new AbortController();
+  /** Requests keep their workspaces and process cleanup owned until they settle. */
+  readonly #requests = new Set<
+    Promise<Result<AnalysisExecution, AnalysisError>>
+  >();
   /** Single-function runs that could not be proven stopped, with their retry owners. */
   readonly #retained: {
     readonly error: ProviderCleanupError;
@@ -242,6 +246,26 @@ export class KunaSessionClient implements AnalysisClient {
           "This Kuna session is closed.",
         ),
       );
+    const request = this.#execute(operation, parameters, {
+      ...options,
+      signal:
+        options.signal === undefined
+          ? this.#session.signal
+          : AbortSignal.any([this.#session.signal, options.signal]),
+    });
+    this.#requests.add(request);
+    try {
+      return await request;
+    } finally {
+      this.#requests.delete(request);
+    }
+  }
+
+  async #execute(
+    operation: AnalysisOperation,
+    parameters: Readonly<Record<string, JsonValue>>,
+    options: ExecutionOptions,
+  ): Promise<Result<AnalysisExecution, AnalysisError>> {
     if (cancelled(options.signal))
       return err(new AnalysisCancelledError(operation));
     if (operation !== "health" && !isKunaOperation(operation))
@@ -322,9 +346,12 @@ export class KunaSessionClient implements AnalysisClient {
     if (!this.#closing) {
       this.#closing = true;
       this.#session.abort();
-      await this.#project;
-      await this.#inventory;
     }
+    // Cancellation starts process shutdown; its completion proves whether it
+    // is safe to remove private copies and exposes any retained cleanup owner.
+    await Promise.allSettled(this.#requests);
+    await this.#project;
+    await this.#inventory;
     const failures: ProviderCleanupError[] = [];
     // Kuna runs in its own process group; an export no other session wants
     // must stop before this session reports itself closed.

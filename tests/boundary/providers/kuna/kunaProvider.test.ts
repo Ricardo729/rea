@@ -419,6 +419,45 @@ it("stops the export it alone wanted before reporting itself closed", async () =
   });
 });
 
+it.each([false, true])(
+  "drains an active single-function request before close (caller signal: %s)",
+  async (withCallerSignal) => {
+    const { kuna, open } = await session("rea-kuna-close-active-", {
+      project: "hang",
+      decompile: "hang",
+    });
+    const client = open();
+    const caller = new AbortController();
+    const request = client.execute(
+      "procedure_pseudo_code",
+      { procedure: "main" },
+      withCallerSignal ? { signal: caller.signal } : {},
+    );
+    try {
+      await expect
+        .poll(async () =>
+          (await fakeKunaCalls(kuna)).filter(
+            ({ argv }) => argv[0] === "decompile",
+          ),
+        )
+        .toHaveLength(1);
+      const call = (await fakeKunaCalls(kuna)).find(
+        ({ argv }) => argv[0] === "decompile",
+      );
+      expect(await client.close()).toEqual({ ok: true, value: null });
+      expect(() => process.kill(call?.pid ?? 0, 0)).toThrow();
+      expect(await request).toMatchObject({
+        ok: false,
+        error: { _tag: "AnalysisCancelledError" },
+      });
+    } finally {
+      caller.abort();
+      await request;
+      await client.close();
+    }
+  },
+);
+
 it("refuses another document, an unsupported operation and a replaced executable", async () => {
   const { kuna, open } = await session("rea-kuna-refusals-");
   const client = open();
@@ -473,6 +512,50 @@ const unprovenCleanupLauncher = (subcommand: string) => {
   };
   return { launcher, release: () => (proven = true) };
 };
+
+it("retains an active request's workspace when close cannot prove its stop", async () => {
+  const unproven = unprovenCleanupLauncher("decompile");
+  const { kuna, open } = await session(
+    "rea-kuna-close-active-unproven-",
+    { project: "hang", decompile: "hang" },
+    {},
+    unproven.launcher,
+  );
+  const client = open();
+  const caller = new AbortController();
+  const request = client.execute(
+    "procedure_pseudo_code",
+    { procedure: "main" },
+    { signal: caller.signal },
+  );
+  try {
+    await expect
+      .poll(async () =>
+        (await fakeKunaCalls(kuna)).filter(
+          ({ argv }) => argv[0] === "decompile",
+        ),
+      )
+      .toHaveLength(1);
+    const closed = await client.close();
+    expect(closed).toMatchObject({
+      ok: false,
+      error: { cleanupIncomplete: true },
+    });
+    expect(await request).toMatchObject({
+      ok: false,
+      error: { cleanupIncomplete: true },
+    });
+    const input = (await fakeKunaCalls(kuna)).find(
+      ({ argv }) => argv[0] === "decompile",
+    )?.argv[1];
+    expect(await readFile(input ?? "", "utf8")).toBe("program bytes");
+  } finally {
+    caller.abort();
+    await request;
+    unproven.release();
+    expect(await client.close()).toEqual({ ok: true, value: null });
+  }
+});
 
 it("keeps reporting a failed close and succeeds once a retry proves the stop", async () => {
   const unproven = unprovenCleanupLauncher("decompile");
