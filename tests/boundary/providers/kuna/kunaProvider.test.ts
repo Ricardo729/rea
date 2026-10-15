@@ -165,6 +165,23 @@ it("commits the observed Kuna release and digest to the analysis profile", async
   });
 });
 
+it("lists the selected document without starting target analysis", async () => {
+  const { kuna, target, cacheRoot, open } = await session(
+    "rea-kuna-document-metadata-",
+    { project: "hang" },
+  );
+  const client = open();
+  try {
+    expect((await run(client, "list_documents")).result).toEqual([target.path]);
+    expect(
+      (await fakeKunaCalls(kuna)).every(({ argv }) => argv[0] === "--version"),
+    ).toBe(true);
+    await expect(readdir(cacheRoot)).rejects.toMatchObject({ code: "ENOENT" });
+  } finally {
+    await client.close();
+  }
+});
+
 it("answers a cold request from one function, then serves the finished export", async () => {
   const { kuna, cacheRoot, open } = await session("rea-kuna-cold-", {
     delayMs: 300,

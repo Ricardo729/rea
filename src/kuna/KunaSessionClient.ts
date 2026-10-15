@@ -313,7 +313,8 @@ export class KunaSessionClient implements AnalysisClient {
             limitations: [],
           }),
         );
-      await this.#startProject(installation.value);
+      if (operation !== "list_documents")
+        await this.#startProject(installation.value);
       const answer = await this.#answer(
         operation,
         parameters,
