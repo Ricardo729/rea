@@ -13,14 +13,14 @@ rea doctor --provider kuna
 
 Select it explicitly with `--provider kuna`, MCP's `open_binary.provider_id: "kuna"`, or `REA_ANALYSIS_PROVIDER=kuna`. With Kuna and another provider configured for the same target, `auto` reports `ambiguous` instead of choosing one.
 
-| Setting                       | Default                                                                 | Meaning                                                                                                                                                                                  |
-| ----------------------------- | ----------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `REA_KUNA_COMMAND`            | none (required)                                                         | Absolute path of the `kuna` executable.                                                                                                                                                  |
-| `REA_KUNA_CACHE_DIR`          | `~/Library/Caches/rea/kuna` (macOS), `$XDG_CACHE_HOME/rea/kuna` (Linux) | Absolute directory REA owns for project exports. Kuna's own spec cache also lives here, not in your Kuna cache.                                                                          |
-| `REA_KUNA_CACHE_MAX_BYTES`    | 4 GiB                                                                   | Size cap; least recently used exports are evicted above it.                                                                                                                              |
-| `REA_KUNA_PROJECT_TIMEOUT_MS` | 30 minutes                                                              | Deadline for one project export.                                                                                                                                                         |
-| `REA_KUNA_TIMEOUT_MS`         | 120 s                                                                   | Deadline for one single-function decompile.                                                                                                                                              |
-| `REA_KUNA_JOBS`               | 1                                                                       | `decompile-project --jobs`. 1 is Kuna's reference answer; more jobs finish sooner but lose callee-first prototypes, and change about 40–60% of function bodies on the measured binaries. |
+| Setting                       | Default                                                                                                                                 | Meaning                                                                                                                                                                                  |
+| ----------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `REA_KUNA_COMMAND`            | none (required)                                                                                                                         | Absolute path of the `kuna` executable.                                                                                                                                                  |
+| `REA_KUNA_CACHE_DIR`          | `~/Library/Caches/rea/kuna` (macOS), `$XDG_CACHE_HOME/rea/kuna` (Linux; `~/.cache/rea/kuna` when `XDG_CACHE_HOME` is unset or relative) | Absolute directory REA owns for project exports. Kuna's own spec cache also lives here, not in your Kuna cache.                                                                          |
+| `REA_KUNA_CACHE_MAX_BYTES`    | 4 GiB                                                                                                                                   | Size cap; least recently used exports are evicted above it.                                                                                                                              |
+| `REA_KUNA_PROJECT_TIMEOUT_MS` | 30 minutes                                                                                                                              | Deadline for one project export.                                                                                                                                                         |
+| `REA_KUNA_TIMEOUT_MS`         | 120 s                                                                                                                                   | Deadline for one single-function decompile.                                                                                                                                              |
+| `REA_KUNA_JOBS`               | 1                                                                                                                                       | `decompile-project --jobs`. 1 is Kuna's reference answer; more jobs finish sooner but lose callee-first prototypes, and change about 40–60% of function bodies on the measured binaries. |
 
 Windows is not supported yet. Supported targets are ELF and thin Mach-O executables for x86-64, AArch64 and ARM; PE and universal Mach-O are rejected with a typed reason.
 
@@ -47,7 +47,7 @@ The first analysis request in a session looks for this target's export in the ca
   - Assembly and data names wait for the export; progress notifications report the wait every ten seconds.
   - A single-function answer says so in its limitations. It lacks the export's whole-program prototypes, so a later request can return different text for the same function.
 
-Each answer's `raw_result.source` records where it came from: `single-function`, or `project-export` with the cache directory, file, byte span and the file's SHA-256. Agents can open or search the export's `.c` and `.asm` there directly when that is cheaper than calling a tool per function. Text read that way is target-derived, like any decompiler output, but it bypasses the untrusted-content marker that REA's tool results carry.
+Pseudocode, assembly, `analyze_function` and data-name answers record where their text came from in `raw_result.source`: `single-function`, or `project-export` with the cache directory. `procedure_pseudo_code` and `procedure_assembly` answers from the export also name the file, byte span and the file's SHA-256. Listings and procedure lookups carry no `raw_result`. Agents can open or search the export's `.c` and `.asm` there directly when that is cheaper than calling a tool per function. Text read that way is target-derived, like any decompiler output, but it bypasses the untrusted-content marker that REA's tool results carry.
 
 The background export belongs to the session. `close_binary`, or the end of a CLI command, cancels it unless another session still waits for it. A one-shot CLI decompile therefore answers from a single-function run; any request that needs the export, such as `procedure_assembly` or `analyze_function`, keeps it.
 
@@ -72,6 +72,9 @@ Builds publish by one rename, so a reader sees a complete export or none. A dama
 
 ```bash
 REA_KUNA_COMMAND=/absolute/path/to/kuna npm run verify:kuna
+# Compare with Ghidra on caller-built binaries
+REA_KUNA_COMMAND=/absolute/path/to/kuna GHIDRA_INSTALL_DIR=/absolute/path/to/ghidra \
+  npm run verify:kuna -- --targets DIR --functions inflate,crc32 --compare-ghidra
 ```
 
-The lane compiles a small source-owned fixture with the host C compiler and verifies the MCP workflow end to end. `--targets DIR --functions a,b` adds caller-built binaries, and `--compare-ghidra` (with `GHIDRA_INSTALL_DIR`) runs the same functions through Ghidra. See [testing](testing.md#kuna-lane) for coverage.
+The lane compiles a small source-owned fixture with the host C compiler and verifies the MCP workflow end to end. `--targets DIR --functions a,b` adds caller-built binaries. `--compare-ghidra` (with `GHIDRA_INSTALL_DIR`) runs those same functions through Ghidra; it requires `--targets` and `--functions` and refuses to run without them. See [testing](testing.md#kuna-lane) for coverage.

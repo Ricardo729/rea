@@ -828,8 +828,9 @@ a fresh server reuses the export without rebuilding it, staging is empty after
 a completed export, and no owned process survives. Pass
 `--targets DIR --functions a,b` to add caller-built binaries laid out as
 `DIR/<flavor>/<name>` beside `<name>.stripped`; addresses come from the
-symbol-bearing build. `--compare-ghidra` with `GHIDRA_INSTALL_DIR` runs the same
-functions through Ghidra and reports latency, sampled process-tree CPU and peak
+symbol-bearing build. `--compare-ghidra` with `GHIDRA_INSTALL_DIR` runs those
+caller-built functions through Ghidra (it refuses to run without `--targets` and
+`--functions`) and reports latency, sampled process-tree CPU and peak
 memory, response size, and goto and warning-marker counts. These counts are not
 a correctness judgement. `--report PATH` writes the JSON report.
 
