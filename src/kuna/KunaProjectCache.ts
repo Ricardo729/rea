@@ -31,8 +31,8 @@ import {
   readKunaExport,
   type KunaExport,
   type KunaExportStatus,
-  type KunaProcessLauncher,
 } from "./KunaProjectExport.js";
+import type { KunaProcessLauncher } from "./KunaCommand.js";
 import type {
   KunaInventoryFunction,
   KunaProjectFunction,
@@ -339,6 +339,19 @@ export class KunaProjectCache {
         this.#scheduleEviction();
     });
     return this.#await(created, request);
+  }
+
+  /**
+   * Wait until a build that every waiter abandoned has stopped its Kuna
+   * process and removed its staging. A build another request still waits for
+   * keeps running and is not awaited.
+   */
+  async settled(key: string): Promise<void> {
+    await Promise.allSettled(
+      [...this.#unfinished]
+        .filter((entry) => entry.key === key && entry.controller.signal.aborted)
+        .map((entry) => entry.promise),
+    );
   }
 
   /** Wait for builds, retry safe file removal, and report unresolved cleanup. */
