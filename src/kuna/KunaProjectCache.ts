@@ -664,7 +664,7 @@ export class KunaProjectCache {
     let deferredByBuild = false;
     for (const entry of entries.sort((a, b) => a.mtimeMs - b.mtimeMs)) {
       if (total <= this.#maxBytes && entry.mtimeMs >= 0) break;
-      if (building.has(entry.key)) {
+      if (building.has(entry.key) || this.#inflight.has(entry.key)) {
         deferredByBuild = true;
         continue;
       }

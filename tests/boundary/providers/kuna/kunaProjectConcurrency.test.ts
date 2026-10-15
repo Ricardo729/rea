@@ -17,6 +17,10 @@ const listing = vi.hoisted(() => ({
   directory: "",
   names: [] as string[],
   gate: undefined as Promise<void> | undefined,
+  arrived: 0,
+  touchPath: "",
+  touchGate: undefined as Promise<void> | undefined,
+  touched: false,
 }));
 
 vi.mock("node:fs/promises", async (importOriginal) => {
@@ -25,10 +29,21 @@ vi.mock("node:fs/promises", async (importOriginal) => {
     ...actual,
     readdir: async (...args: Parameters<typeof actual.readdir>) => {
       if (String(args[0]) === listing.directory && listing.gate !== undefined) {
+        listing.arrived += 1;
         await listing.gate;
         return listing.names;
       }
       return actual.readdir(...args);
+    },
+    utimes: async (...args: Parameters<typeof actual.utimes>) => {
+      await actual.utimes(...args);
+      if (
+        String(args[0]) === listing.touchPath &&
+        listing.touchGate !== undefined
+      ) {
+        listing.touched = true;
+        await listing.touchGate;
+      }
     },
   };
 });
@@ -37,9 +52,21 @@ afterEach(() => {
   listing.directory = "";
   listing.gate = undefined;
   listing.names = [];
+  listing.arrived = 0;
+  listing.touchPath = "";
+  listing.touchGate = undefined;
+  listing.touched = false;
 });
 
 const it = test.skipIf(process.platform === "win32");
+
+const barrier = () => {
+  let release = () => {};
+  const promise = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  return { promise, release };
+};
 
 const fixture = async (maxBytes = 64 * 1024 ** 2) => {
   const root = await createTestTempDirectory("rea-kuna-concurrency-");
@@ -149,6 +176,54 @@ it.each(["decompiling", "sealing"] as const)(
     expect(await cache.close()).toEqual({ ok: true, value: null });
   },
 );
+
+it("protects a cache request that arrives after an eviction snapshot starts", async () => {
+  const { cache, cacheRoot, request } = await fixture(600 * 1024);
+  const actual =
+    await vi.importActual<typeof import("node:fs/promises")>(
+      "node:fs/promises",
+    );
+  const firstInput = await request("first");
+  const first = await cache.build(firstInput);
+  if (!first.ok) throw first.error;
+  const snapshot = barrier();
+  const touch = barrier();
+  listing.directory = join(cacheRoot, "projects");
+  listing.gate = snapshot.promise;
+  listing.touchPath = join(listing.directory, first.value.key);
+  listing.touchGate = touch.promise;
+  const releases: (() => void)[] = [];
+  const pinResult = async (pending: ReturnType<KunaProjectCache["build"]>) => {
+    const result = await pending;
+    if (!result.ok) throw result.error;
+    releases.push(cache.pin(result.value.key));
+    return result.value;
+  };
+  const second = pinResult(cache.build(await request("second")));
+  let warm: ReturnType<typeof pinResult> | undefined;
+  onTestFinished(async () => {
+    snapshot.release();
+    touch.release();
+    await Promise.allSettled(warm === undefined ? [second] : [second, warm]);
+    for (const release of releases) release();
+    const closed = await cache.close();
+    if (!closed.ok) throw closed.error;
+  });
+  await expect.poll(() => listing.arrived).toBe(1);
+  warm = pinResult(cache.build(firstInput));
+  await expect.poll(() => listing.touched).toBe(true);
+  listing.names = await actual.readdir(listing.directory);
+  snapshot.release();
+  await second;
+  touch.release();
+  const reused = await warm;
+  expect(
+    await readFile(
+      join(reused.directory, reused.manifest.files.c.path),
+      "utf8",
+    ),
+  ).toContain("// Function: main @ 0x1000");
+});
 
 it("keeps a shared progress callback registered for the remaining waiter", async () => {
   const { kuna, cache, request } = await fixture();
