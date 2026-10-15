@@ -12,6 +12,7 @@ import type { ProviderCleanupError } from "../domain/providerCleanupError.js";
 import { err, ok, type Result } from "../domain/result.js";
 import { hashStableFile } from "../filesystem/StableFileHash.js";
 import { prepareProcessOwnershipInspection } from "../process/ProcessOwnershipObservation.js";
+import type { ProviderProcessSupervisor } from "../process/ProviderProcess.js";
 import {
   copyAndHash,
   KUNA_INVENTORY_OUTPUT_BYTES,
@@ -80,7 +81,11 @@ export type KunaExportOutcome =
       readonly kind: "done";
       readonly result: Result<KunaExport, AnalysisError>;
     }
-  | { readonly kind: "retained"; readonly error: ProviderCleanupError };
+  | {
+      readonly kind: "retained";
+      readonly error: ProviderCleanupError;
+      readonly owner: ProviderProcessSupervisor | undefined;
+    };
 
 /** One export of a target into a private workspace. */
 export interface KunaExportRequest {
@@ -193,7 +198,11 @@ export const exportKunaProject = async (
       ok: false as const,
       outcome:
         outcome.kind === "retained"
-          ? ({ kind: "retained", error: outcome.error } as const)
+          ? ({
+              kind: "retained",
+              error: outcome.error,
+              owner: outcome.owner,
+            } as const)
           : ({ kind: "done", result: err(outcome.error) } as const),
     };
   };

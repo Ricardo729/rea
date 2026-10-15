@@ -1,5 +1,12 @@
 import { createHash } from "node:crypto";
-import { appendFile, readdir, readFile, writeFile } from "node:fs/promises";
+import {
+  appendFile,
+  mkdir,
+  readdir,
+  readFile,
+  rename,
+  writeFile,
+} from "node:fs/promises";
 import { join } from "node:path";
 
 import { expect, it as test } from "vitest";
@@ -7,7 +14,10 @@ import { expect, it as test } from "vitest";
 import type { AnalysisClient } from "../../../../src/application/AnalysisProvider.js";
 import type { BinaryTarget } from "../../../../src/domain/binaryTargetTypes.js";
 import type { JsonValue } from "../../../../src/domain/jsonValue.js";
+import type { KunaProcessLauncher } from "../../../../src/kuna/KunaCommand.js";
 import { KunaProvider } from "../../../../src/kuna/KunaProvider.js";
+import { cleanupOwnedProcessGroup } from "../../../../src/process/ProcessOwnership.js";
+import { spawnOwnedProviderProcess } from "../../../../src/process/ProviderProcess.js";
 import { createTestTempDirectory } from "../../../fixtures/temporaryDirectory.js";
 import {
   fakeKunaCalls,
@@ -32,6 +42,7 @@ const session = async (
   prefix: string,
   behavior: FakeKunaBehavior = {},
   environment: Readonly<Record<string, string>> = {},
+  launcher?: KunaProcessLauncher,
 ) => {
   const root = await createTestTempDirectory(prefix);
   const kuna = await writeFakeKuna(root, { functions: FUNCTIONS, ...behavior });
@@ -48,7 +59,10 @@ const session = async (
   const cacheRoot = join(root, "cache");
   const provider = new KunaProvider(
     { REA_KUNA_COMMAND: kuna, REA_KUNA_CACHE_DIR: cacheRoot, ...environment },
-    { platform: process.platform },
+    {
+      platform: process.platform,
+      ...(launcher === undefined ? {} : { launcher }),
+    },
   );
   const profile = await provider.resolveAnalysisProfile(target);
   if (!profile.ok || profile.value.profile === null)
@@ -436,4 +450,188 @@ it("refuses another document, an unsupported operation and a replaced executable
     },
   });
   await replaced.close();
+});
+
+/**
+ * Launch for real, but have cleanup of the selected subcommand report an
+ * unproven stop until `release` is called, as a lost ownership proof would.
+ */
+const unprovenCleanupLauncher = (subcommand: string) => {
+  let proven = false;
+  const launcher: KunaProcessLauncher = async (options) => {
+    const spawned = await spawnOwnedProviderProcess(options);
+    if (options.arguments[0] !== subcommand) return spawned;
+    return {
+      ...spawned,
+      cleanup: async () => {
+        const cleaned = await cleanupOwnedProcessGroup(spawned.ownership);
+        return proven
+          ? cleaned
+          : { cleaned: false, reason: `${subcommand} stop unproven` };
+      },
+    };
+  };
+  return { launcher, release: () => (proven = true) };
+};
+
+it("keeps reporting a failed close and succeeds once a retry proves the stop", async () => {
+  const unproven = unprovenCleanupLauncher("decompile");
+  const { open } = await session(
+    "rea-kuna-close-retry-",
+    { project: "hang", decompile: "hang" },
+    { REA_KUNA_TIMEOUT_MS: "300" },
+    unproven.launcher,
+  );
+  const client = open();
+
+  expect(
+    await client.execute("procedure_pseudo_code", { procedure: "main" }),
+  ).toMatchObject({ ok: false, error: { cleanupIncomplete: true } });
+  const first = await client.close();
+  expect(first).toMatchObject({
+    ok: false,
+    error: { diagnostics: { reason: "decompile stop unproven" } },
+  });
+  // A retry that still cannot prove the stop keeps failing.
+  expect((await client.close()).ok).toBe(false);
+
+  unproven.release();
+  expect(await client.close()).toEqual({ ok: true, value: null });
+  expect(await client.close()).toEqual({ ok: true, value: null });
+});
+
+it("reports an abandoned export's unproven cleanup from close", async () => {
+  const unproven = unprovenCleanupLauncher("decompile-project");
+  const { kuna, open } = await session(
+    "rea-kuna-close-export-",
+    { project: "hang" },
+    {},
+    unproven.launcher,
+  );
+  const client = open();
+  await run(client, "procedure_pseudo_code", { procedure: "main" });
+  await expect.poll(() => exportsOf(kuna)).toHaveLength(1);
+
+  expect(await client.close()).toMatchObject({
+    ok: false,
+    error: { diagnostics: { reason: "decompile-project stop unproven" } },
+  });
+  unproven.release();
+  expect(await client.close()).toEqual({ ok: true, value: null });
+});
+
+it("refuses to launch an executable replaced after the target was opened", async () => {
+  const { kuna, open } = await session("rea-kuna-swapped-", {
+    project: "exit-failure",
+  });
+  const client = open();
+  await run(client, "procedure_pseudo_code", { procedure: "main" });
+
+  await appendFile(kuna, "\n// replaced mid-session\n");
+  expect(
+    await client.execute("procedure_pseudo_code", { procedure: "parse" }),
+  ).toMatchObject({
+    ok: false,
+    error: {
+      _tag: "ProviderAdapterError",
+      userMessage: expect.stringContaining(
+        "changed after this target was opened",
+      ),
+    },
+  });
+  await client.close();
+});
+
+it("recovers when another server evicts the export this session adopted", async () => {
+  const { cacheRoot, open } = await session("rea-kuna-evicted-");
+  const client = open();
+  await run(client, "procedure_assembly", { procedure: "main" });
+  const [key] = await readdir(join(cacheRoot, "projects"));
+  await mkdir(join(cacheRoot, "trash"), { recursive: true });
+  await rename(
+    join(cacheRoot, "projects", key ?? ""),
+    join(cacheRoot, "trash", "elsewhere"),
+  );
+
+  // Pseudocode falls back while the export rebuilds; assembly waits for it.
+  const pseudocode = await run(client, "procedure_pseudo_code", {
+    procedure: "parse",
+  });
+  expect(pseudocode.result).toContain("parse");
+  const assembly = await run(client, "procedure_assembly", {
+    procedure: "parse",
+  });
+  expect(assembly.rawResult).toMatchObject({
+    source: { kind: "project-export" },
+  });
+  expect(await readdir(join(cacheRoot, "projects"))).toEqual([key]);
+  await client.close();
+});
+
+it("reports a failed export as failed rather than building", async () => {
+  const { open } = await session("rea-kuna-failed-state-", {
+    project: "exit-failure",
+  });
+  const client = open();
+  await client.execute("procedure_assembly", { procedure: "main" });
+
+  expect(
+    (await run(client, "procedure_pseudo_code", { procedure: "main" }))
+      .rawResult,
+  ).toMatchObject({
+    project_export: {
+      state: "failed",
+      reason: expect.stringContaining("not in recognized object file format"),
+    },
+  });
+  await client.close();
+});
+
+it("lets one caller stop waiting for the shared inventory without failing another", async () => {
+  const { open } = await session("rea-kuna-shared-inventory-", {
+    inventoryDelayMs: 700,
+  });
+  const client = open();
+  const first = new AbortController();
+
+  const cancelled = client.execute(
+    "list_procedures",
+    {},
+    { signal: first.signal },
+  );
+  const waiting = client.execute("search_procedures", { pattern: "main" });
+  setTimeout(() => first.abort(), 100);
+
+  expect(await cancelled).toMatchObject({
+    ok: false,
+    error: { _tag: "AnalysisCancelledError" },
+  });
+  expect(await waiting).toMatchObject({
+    ok: true,
+    value: { result: [{ address: "0x1000", value: "main" }] },
+  });
+  await client.close();
+});
+
+it("leaves no private copy behind when workspace setup fails", async () => {
+  const { target, open } = await session("rea-kuna-workspace-leak-", {
+    project: "hang",
+  });
+  const runtime = await createTestTempDirectory("rea-kuna-runtime-");
+  const previous = process.env.TMPDIR;
+  process.env.TMPDIR = runtime;
+  try {
+    const client = open();
+    // A vanished target makes the copy itself throw mid-setup.
+    await rename(target.path, `${target.path}.moved`);
+
+    expect(
+      await client.execute("procedure_pseudo_code", { procedure: "main" }),
+    ).toMatchObject({ ok: false });
+    expect(await readdir(runtime)).toEqual([]);
+    expect(await client.close()).toEqual({ ok: true, value: null });
+  } finally {
+    if (previous === undefined) delete process.env.TMPDIR;
+    else process.env.TMPDIR = previous;
+  }
 });

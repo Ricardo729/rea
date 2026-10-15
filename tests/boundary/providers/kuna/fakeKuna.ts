@@ -27,6 +27,8 @@ export interface FakeKunaBehavior {
   /** Extra `.asm` bytes, for capacity tests. */
   readonly asmPadding?: number;
   readonly decompile?: "ok" | "hang";
+  /** Milliseconds `functions --json` takes before printing. */
+  readonly inventoryDelayMs?: number;
   /** Milliseconds the export takes before writing its files. */
   readonly delayMs?: number;
 }
@@ -56,7 +58,7 @@ if (args[0] === "--version") {
   else if (mode === "not-json") process.stdout.write("functions: 2\n");
   else {
     const listed = [...functions, { name: "puts", addr: "0x2000" }].map((fn) => ({ name: fn.name, address: parseInt(fn.addr, 16), address_hex: fn.addr, aliases: [], object_location: null, size: fn.name === "puts" ? 0 : 16 }));
-    process.stdout.write(JSON.stringify({ binary: args[1], count: listed.length, total: listed.length, error: null, functions: listed }, null, 2) + "\n");
+    setTimeout(() => process.stdout.write(JSON.stringify({ binary: args[1], count: listed.length, total: listed.length, error: null, functions: listed }, null, 2) + "\n"), behavior.inventoryDelayMs ?? 0);
   }
 } else if (args[0] === "decompile-project") {
   const input = args[1];

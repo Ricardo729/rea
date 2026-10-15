@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { createReadStream, createWriteStream } from "node:fs";
+import { stat } from "node:fs/promises";
 import { Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 
@@ -15,9 +16,11 @@ import {
   OwnedCommandFailure,
   runOwnedCommand,
 } from "../process/OwnedCommand.js";
+import { hashStableFile } from "../filesystem/StableFileHash.js";
 import type {
   OwnedProviderProcessSpawnOptions,
   ProviderProcessSnapshot,
+  ProviderProcessSupervisor,
   SpawnedOwnedProviderProcess,
 } from "../process/ProviderProcess.js";
 import {
@@ -61,16 +64,76 @@ export interface KunaCommandRequest {
 export type KunaCommandOutcome =
   | { readonly kind: "ok"; readonly snapshot: ProviderProcessSnapshot }
   | { readonly kind: "failed"; readonly error: AnalysisError }
-  | { readonly kind: "retained"; readonly error: ProviderCleanupError };
+  | {
+      readonly kind: "retained";
+      readonly error: ProviderCleanupError;
+      /** The supervisor that can retry stopping the process tree, when one exists. */
+      readonly owner: ProviderProcessSupervisor | undefined;
+    };
 
 const message = (cause: unknown): string =>
   cause instanceof Error ? cause.message : String(cause);
+
+/** File metadata that, unchanged, lets a verified digest stand without re-hashing. */
+const verifiedExecutables = new Map<
+  string,
+  { readonly identity: string; readonly sha256: string }
+>();
+
+/**
+ * Confirm the executable still has the digest its analysis profile committed,
+ * so no answer names one Kuna build while another produced it.
+ */
+const verifyExecutable = async (
+  installation: KunaInstallation,
+  signal: AbortSignal,
+): Promise<string | undefined> => {
+  const status = await stat(installation.executable, { bigint: true });
+  const identity = [
+    status.dev,
+    status.ino,
+    status.size,
+    status.mtimeNs,
+    status.ctimeNs,
+  ].join(":");
+  const known = verifiedExecutables.get(installation.executable);
+  let sha256 = known?.identity === identity ? known.sha256 : undefined;
+  if (sha256 === undefined) {
+    sha256 = (await hashStableFile(installation.executable, signal)).sha256;
+    verifiedExecutables.set(installation.executable, { identity, sha256 });
+  }
+  return sha256 === installation.sha256 ? undefined : sha256;
+};
 
 /** Run Kuna under an owned process group with REA's environment and limits. */
 export const runKunaCommand = async (
   request: KunaCommandRequest,
 ): Promise<KunaCommandOutcome> => {
   const { installation } = request;
+  try {
+    const changed = await verifyExecutable(installation, request.signal);
+    if (changed !== undefined)
+      return {
+        kind: "failed",
+        error: new ProviderAdapterError(KUNA_PROVIDER_ID, request.operation, {
+          userMessage: `${installation.executable} changed after this target was opened; reopen the target so REA probes the current Kuna executable.`,
+          diagnostics: {
+            expected_sha256: installation.sha256,
+            observed_sha256: changed,
+          },
+        }),
+      };
+  } catch (cause: unknown) {
+    return {
+      kind: "failed",
+      error: request.signal.aborted
+        ? new AnalysisCancelledError(request.operation, { cause })
+        : new ProviderAdapterError(KUNA_PROVIDER_ID, request.operation, {
+            cause,
+            userMessage: `Cannot verify ${installation.executable}: ${message(cause)}`,
+          }),
+    };
+  }
   try {
     const snapshot = await runOwnedCommand(
       {
@@ -166,6 +229,7 @@ const commandFailure = (
         { reason: cause.cleanupFailure },
         { operation, cause },
       ),
+      owner: cause.cleanupOwner,
     };
   if (cause.reason === "cancelled")
     return {

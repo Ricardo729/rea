@@ -32,6 +32,7 @@ import { ProviderCleanupError } from "../domain/providerCleanupError.js";
 import { err, ok, type Result } from "../domain/result.js";
 import { PrivateRuntimeRoot } from "../process/PrivateRuntimeRoot.js";
 import { prepareProcessOwnershipInspection } from "../process/ProcessOwnershipObservation.js";
+import type { ProviderProcessSupervisor } from "../process/ProviderProcess.js";
 import {
   copyAndHash,
   KUNA_INVENTORY_OUTPUT_BYTES,
@@ -94,6 +95,34 @@ interface Answer {
   readonly limitations: readonly string[];
 }
 
+/**
+ * Wait for work this session owns, stopping only this caller's wait when its
+ * signal aborts; the work itself continues for other callers.
+ */
+const waitFor = <T>(
+  work: Promise<Result<T, AnalysisError>>,
+  signal: AbortSignal | undefined,
+  operation: string,
+): Promise<Result<T, AnalysisError>> => {
+  if (signal === undefined) return work;
+  if (signal.aborted)
+    return Promise.resolve(err(new AnalysisCancelledError(operation)));
+  return new Promise((resolve) => {
+    const onAbort = () => resolve(err(new AnalysisCancelledError(operation)));
+    signal.addEventListener("abort", onAbort, { once: true });
+    void work.then((result) => {
+      signal.removeEventListener("abort", onAbort);
+      resolve(result);
+    });
+  });
+};
+
+/** A file the adopted export named is gone, e.g. evicted by another REA process. */
+const isMissing = (cause: unknown): boolean =>
+  cause instanceof Error &&
+  "code" in cause &&
+  (cause.code === "ENOENT" || cause.code === "ENOTDIR");
+
 /** Read through a call so a check before an await does not narrow later ones. */
 const cancelled = (signal: AbortSignal | undefined): boolean =>
   signal?.aborted === true;
@@ -151,7 +180,13 @@ export class KunaSessionClient implements AnalysisClient {
   readonly #launcher: KunaProcessLauncher | undefined;
   /** Owns background work: aborting it cancels this session's export interest. */
   readonly #session = new AbortController();
-  readonly #retained: ProviderCleanupError[] = [];
+  /** Single-function runs that could not be proven stopped, with their retry owners. */
+  readonly #retained: {
+    readonly error: ProviderCleanupError;
+    owner: ProviderProcessSupervisor | undefined;
+  }[] = [];
+  /** Private roots whose removal failed during setup or close. */
+  readonly #leakedRoots: PrivateRuntimeRoot[] = [];
   #installation: Promise<Result<KunaInstallation, AnalysisError>> | undefined;
   #workspace:
     | Promise<
@@ -171,7 +206,11 @@ export class KunaSessionClient implements AnalysisClient {
   #inventoryIndex: InventoryIndex | undefined;
   #status: KunaExportStatus | undefined;
   #key: string | undefined;
+  #exportFailure: string | undefined;
   #releasePin: (() => void) | undefined;
+  /** Set once close starts; new requests are refused from then on. */
+  #closing = false;
+  /** Set only when close has released every owned resource. */
   #closed = false;
 
   constructor(
@@ -195,7 +234,7 @@ export class KunaSessionClient implements AnalysisClient {
     parameters: Readonly<Record<string, JsonValue>>,
     options: ExecutionOptions = {},
   ): Promise<Result<AnalysisExecution, AnalysisError>> {
-    if (this.#closed)
+    if (this.#closing)
       return err(
         new AnalysisCapabilityUnavailableError(
           KUNA_PROVIDER_ID,
@@ -274,50 +313,70 @@ export class KunaSessionClient implements AnalysisClient {
     }
   }
 
+  /**
+   * Release everything this session owns. A failed close keeps reporting its
+   * failure, and each later call retries the cleanup that remains.
+   */
   async close(): Promise<Result<null, AnalysisError>> {
     if (this.#closed) return ok(null);
-    this.#closed = true;
-    this.#session.abort();
-    const exported = await this.#project;
+    if (!this.#closing) {
+      this.#closing = true;
+      this.#session.abort();
+      await this.#project;
+      await this.#inventory;
+    }
+    const failures: ProviderCleanupError[] = [];
     // Kuna runs in its own process group; an export no other session wants
     // must stop before this session reports itself closed.
-    if (this.#key !== undefined) await this.#cache.settled(this.#key);
-    this.#releasePin?.();
-    if (
-      exported !== undefined &&
-      !exported.ok &&
-      exported.error instanceof ProviderCleanupError
-    )
-      this.#retained.push(exported.error);
+    if (this.#key !== undefined) {
+      const settled = await this.#cache.settled(this.#key);
+      if (!settled.ok) failures.push(settled.error);
+    }
+    for (const retained of [...this.#retained]) {
+      const stopped = await retained.owner?.stop();
+      if (stopped !== undefined && stopped.status !== "incomplete")
+        this.#retained.splice(this.#retained.indexOf(retained), 1);
+    }
+    failures.push(...this.#retained.map(({ error }) => error));
     const workspace = await this.#workspace;
-    // A per-function run that could not be proven stopped may still use the copy.
-    if (this.#retained.length > 0)
+    // A single-function run that may still be running keeps its copy.
+    if (this.#retained.length === 0) {
+      if (workspace?.ok === true) {
+        this.#leakedRoots.push(workspace.value.root);
+        this.#workspace = undefined;
+      }
+      for (const root of [...this.#leakedRoots])
+        try {
+          await root.close();
+          this.#leakedRoots.splice(this.#leakedRoots.indexOf(root), 1);
+        } catch (cause: unknown) {
+          failures.push(
+            new ProviderCleanupError(
+              KUNA_PROVIDER_ID,
+              [root.path],
+              { reason: message(cause) },
+              { cause },
+            ),
+          );
+        }
+    }
+    if (failures.length > 0)
       return err(
         new ProviderCleanupError(
           KUNA_PROVIDER_ID,
-          this.#retained.flatMap((retained) => retained.cleanupResources),
+          failures.flatMap((failed) => failed.cleanupResources),
           {
-            reason: this.#retained
-              .map((retained) =>
-                String(retained.diagnostics?.["reason"] ?? retained.message),
+            reason: failures
+              .map((failed) =>
+                String(failed.diagnostics?.["reason"] ?? failed.message),
               )
               .join("; "),
           },
         ),
       );
-    if (workspace?.ok === true)
-      try {
-        await workspace.value.root.close();
-      } catch (cause: unknown) {
-        return err(
-          new ProviderCleanupError(
-            KUNA_PROVIDER_ID,
-            [workspace.value.root.path],
-            { reason: message(cause) },
-            { cause },
-          ),
-        );
-      }
+    this.#releasePin?.();
+    this.#releasePin = undefined;
+    this.#closed = true;
     return ok(null);
   }
 
@@ -381,6 +440,8 @@ export class KunaSessionClient implements AnalysisClient {
     if (this.#ready !== undefined)
       return { state: "ready", key: this.#ready.key };
     if (this.#project === undefined) return { state: "not-started" };
+    if (this.#exportFailure !== undefined)
+      return { state: "failed", reason: this.#exportFailure };
     return {
       state: "building",
       phase: this.#status?.phase ?? null,
@@ -423,7 +484,9 @@ export class KunaSessionClient implements AnalysisClient {
       });
     }
     if (operation === "address_name")
-      return this.#addressName(parameters, inventory.value, options);
+      return this.#withExport(installation, () =>
+        this.#addressName(parameters, inventory.value, options),
+      );
     const entry = this.#resolve(operation, parameters, inventory.value);
     if (!entry.ok) return entry;
     const locations = [
@@ -438,26 +501,23 @@ export class KunaSessionClient implements AnalysisClient {
           limitations: [],
         });
       case "procedure_pseudo_code": {
-        const pseudocode = await this.#pseudocode(
-          operation,
-          entry.value,
-          installation,
-          options,
+        const pseudocode = await this.#withExport(installation, () =>
+          this.#pseudocode(operation, entry.value, installation, options),
         );
         if (!pseudocode.ok) return pseudocode;
         return ok({ ...pseudocode.value, locations });
       }
       case "procedure_assembly": {
-        const assembly = await this.#assemblyText(
-          operation,
-          entry.value,
-          options,
+        const assembly = await this.#withExport(installation, () =>
+          this.#assemblyText(operation, entry.value, options),
         );
         if (!assembly.ok) return assembly;
         return ok({ ...assembly.value, locations });
       }
       case "analyze_function":
-        return this.#dossier(operation, entry.value, installation, options);
+        return this.#withExport(installation, () =>
+          this.#dossier(operation, entry.value, installation, options),
+        );
     }
   }
 
@@ -588,7 +648,7 @@ export class KunaSessionClient implements AnalysisClient {
         limitations: [],
       });
     }
-    const workspace = await this.#ensureWorkspace(options);
+    const workspace = await this.#ensureWorkspace();
     if (!workspace.ok) return workspace;
     const run = await runKunaCommand({
       installation,
@@ -602,7 +662,7 @@ export class KunaSessionClient implements AnalysisClient {
       launcher: this.#launcher,
     });
     if (run.kind === "retained") {
-      this.#retained.push(run.error);
+      this.#retained.push({ error: run.error, owner: run.owner });
       return err(run.error);
     }
     if (run.kind === "failed") return err(run.error);
@@ -827,9 +887,42 @@ export class KunaSessionClient implements AnalysisClient {
         },
       })
       .then((result) => {
-        if (result.ok && !this.#closed) this.#adopt(result.value);
+        if (result.ok && !this.#closing) this.#adopt(result.value);
+        else if (!result.ok && !this.#closing)
+          this.#exportFailure =
+            result.error.userMessage ?? result.error.message;
         return result;
       });
+  }
+
+  /**
+   * Run a read against the adopted export. Cache pins hold only within this
+   * process, so another REA server can evict the files; then forget the export,
+   * start it again and run the read once more, which falls back or waits.
+   */
+  async #withExport<T>(
+    installation: KunaInstallation,
+    read: () => Promise<T>,
+  ): Promise<T> {
+    try {
+      return await read();
+    } catch (cause: unknown) {
+      if (!isMissing(cause) || this.#ready === undefined) throw cause;
+      this.#forgetProject();
+      await this.#startProject(installation);
+      return read();
+    }
+  }
+
+  #forgetProject(): void {
+    this.#releasePin?.();
+    this.#releasePin = undefined;
+    this.#ready = undefined;
+    this.#blocks = undefined;
+    this.#assembly = undefined;
+    this.#project = undefined;
+    this.#status = undefined;
+    this.#exportFailure = undefined;
   }
 
   #adopt(project: KunaProject): void {
@@ -874,21 +967,7 @@ export class KunaSessionClient implements AnalysisClient {
         .catch(() => undefined);
     }, WAIT_PROGRESS_INTERVAL_MS);
     try {
-      const signal = options.signal;
-      const settled = await (signal === undefined
-        ? project
-        : Promise.race([
-            project,
-            new Promise<"cancelled">((resolve) => {
-              if (signal.aborted) resolve("cancelled");
-              signal.addEventListener("abort", () => resolve("cancelled"), {
-                once: true,
-              });
-            }),
-          ]));
-      if (settled === "cancelled")
-        return err(new AnalysisCancelledError(operation));
-      return settled;
+      return await waitFor(project, options.signal, operation);
     } finally {
       clearInterval(timer);
     }
@@ -922,18 +1001,22 @@ export class KunaSessionClient implements AnalysisClient {
     options: ExecutionOptions,
   ): Promise<Result<readonly KunaInventoryFunction[], AnalysisError>> {
     if (this.#ready !== undefined) return ok(this.#ready.inventory);
-    this.#inventory ??= this.#listInventory(installation, options);
-    const listed = await this.#inventory;
-    // A failed or cancelled quick listing is retried by the next request.
-    if (!listed.ok) this.#inventory = undefined;
-    return listed;
+    if (this.#inventory === undefined) {
+      // The session owns the shared run; each caller only stops waiting.
+      const run = this.#listInventory(installation);
+      this.#inventory = run;
+      void run.then((listed) => {
+        // A failed quick listing is retried by the next request.
+        if (!listed.ok && this.#inventory === run) this.#inventory = undefined;
+      });
+    }
+    return waitFor(this.#inventory, options.signal, "list_procedures");
   }
 
   async #listInventory(
     installation: KunaInstallation,
-    options: ExecutionOptions,
   ): Promise<Result<readonly KunaInventoryFunction[], AnalysisError>> {
-    const workspace = await this.#ensureWorkspace(options);
+    const workspace = await this.#ensureWorkspace();
     if (!workspace.ok) return workspace;
     const run = await runKunaCommand({
       installation,
@@ -943,11 +1026,11 @@ export class KunaSessionClient implements AnalysisClient {
       timeoutMs: installation.configuration.functionTimeoutMs,
       reportedTimeoutMs: installation.configuration.functionTimeoutMs,
       outputBytes: KUNA_INVENTORY_OUTPUT_BYTES,
-      signal: options.signal ?? this.#session.signal,
+      signal: this.#session.signal,
       launcher: this.#launcher,
     });
     if (run.kind === "retained") {
-      this.#retained.push(run.error);
+      this.#retained.push({ error: run.error, owner: run.owner });
       return err(run.error);
     }
     if (run.kind === "failed") return err(run.error);
@@ -962,9 +1045,7 @@ export class KunaSessionClient implements AnalysisClient {
   }
 
   /** A private, digest-verified copy of the target for single-function runs. */
-  async #ensureWorkspace(
-    options: ExecutionOptions,
-  ): Promise<
+  async #ensureWorkspace(): Promise<
     Result<
       { readonly root: PrivateRuntimeRoot; readonly input: string },
       AnalysisError
@@ -972,27 +1053,41 @@ export class KunaSessionClient implements AnalysisClient {
   > {
     this.#workspace ??= (async () => {
       const root = await PrivateRuntimeRoot.create({ prefix: "rea-kuna-" });
-      const input = join(root.path, basename(this.#target.path));
-      const digest = await copyAndHash(
-        this.#target.path,
-        input,
-        this.#session.signal,
-      );
-      if (digest !== this.#target.sha256) {
-        await root.close();
-        return err(
-          new AnalysisArtifactChangedError(
-            "kuna:workspace",
-            this.#target.path,
-            "the target no longer matches the digest selected for analysis",
-          ),
+      try {
+        const input = join(root.path, basename(this.#target.path));
+        const digest = await copyAndHash(
+          this.#target.path,
+          input,
+          this.#session.signal,
         );
+        if (digest !== this.#target.sha256) {
+          await this.#release(root);
+          return err(
+            new AnalysisArtifactChangedError(
+              "kuna:workspace",
+              this.#target.path,
+              "the target no longer matches the digest selected for analysis",
+            ),
+          );
+        }
+        await prepareProcessOwnershipInspection(this.#session.signal);
+        return ok({ root, input });
+      } catch (cause: unknown) {
+        await this.#release(root);
+        throw cause;
       }
-      await prepareProcessOwnershipInspection(options.signal);
-      return ok({ root, input });
     })().catch((cause: unknown) => err(failure("kuna:workspace", cause)));
     const workspace = await this.#workspace;
     if (!workspace.ok) this.#workspace = undefined;
     return workspace;
+  }
+
+  /** Remove a private root, keeping it for close to retry when removal fails. */
+  async #release(root: PrivateRuntimeRoot): Promise<void> {
+    try {
+      await root.close();
+    } catch {
+      this.#leakedRoots.push(root);
+    }
   }
 }
