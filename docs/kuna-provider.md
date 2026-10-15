@@ -66,7 +66,7 @@ REA writes Kuna's exports only inside `REA_KUNA_CACHE_DIR`:
 - `trash/` holds evicted exports awaiting removal.
 - `home/` is Kuna's HOME.
 
-Builds publish by one rename, so a reader sees a complete export or none. A damaged or edited export is removed and rebuilt. Staging left by a Kuna process REA could not prove stopped is marked and never removed automatically. `rea doctor --provider kuna` reports the cache directory without creating it.
+Builds publish by one rename, so a reader sees a complete export or none. A session keeps the export it uses from eviction only within its own REA process. If another REA process sharing the cache evicts it, the session rebuilds it; meanwhile pseudocode falls back to single-function runs. A damaged or edited export is removed and rebuilt. Staging left by a Kuna process REA could not prove stopped is marked and never removed automatically. `rea doctor --provider kuna` reports the cache directory without creating it.
 
 ## Verify with a real Kuna
 
